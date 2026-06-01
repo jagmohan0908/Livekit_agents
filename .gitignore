@@ -3,6 +3,7 @@
 !.env.example
 creds.json
 service-account.json
+livekit*.toml
 *.jsonl
 __pycache__/
 *.py[cod]

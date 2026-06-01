@@ -3,6 +3,7 @@ import datetime
 import os
 import re
 import tempfile
+import json
 from typing import Optional
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -44,6 +45,22 @@ logger.info(
     bool(os.getenv("LIVEKIT_URL")),
     bool(os.getenv("GOOGLE_CLOUD_PROJECT")),
     bool(os.getenv("MCP_SERVER_URL")),
+)
+
+
+DEFAULT_AGENT_NAME = "SRIAAS Assistant"
+DEFAULT_GREETING_INSTRUCTION = (
+    "The call has just connected. Immediately greet the customer warmly in Hindi "
+    "and introduce yourself and SRIAAS."
+)
+CONFIG_LOAD_FAILURE_PROMPT = (
+    "The voice-agent profile could not be loaded from Frappe. Do not use any default "
+    "sales, medical, or identity prompt. Politely say in Hindi that the system is not "
+    "ready for this call and ask the caller to try again later."
+)
+CONFIG_LOAD_FAILURE_GREETING = (
+    "Politely say in Hindi: Maaf kijiye, abhi voice agent configuration load nahi ho paayi. "
+    "Kripya thodi der baad call kijiye."
 )
 
 
@@ -89,9 +106,85 @@ def clean_phone_number(phone_str: str) -> str:
     return cleaned
 
 
+def _load_job_metadata(ctx: JobContext) -> dict:
+    job = getattr(ctx, "job", None)
+    raw_metadata = getattr(job, "metadata", "") if job else ""
+    if not raw_metadata:
+        return {}
+    try:
+        data = json.loads(raw_metadata)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("LiveKit job metadata is not valid JSON: %s", raw_metadata)
+        return {}
+
+
+async def fetch_frappe_voice_config(
+    caller_phone: Optional[str],
+    did_number: Optional[str],
+    metadata: dict,
+) -> dict:
+    """Fetch the active voice profile from Frappe."""
+    import aiohttp
+
+    base_url = (os.getenv("FRAPPE_BASE_URL") or os.getenv("VOBIZ_AI_BASE_URL") or "").rstrip("/")
+    secret = os.getenv("VOICE_AGENT_CONFIG_SECRET") or os.getenv("X_VOICE_AGENT_SECRET") or ""
+    if not base_url:
+        logger.info("FRAPPE_BASE_URL is not configured; using local agent prompt.")
+        return {}
+
+    params = {
+        "voice_agent_profile": metadata.get("voice_agent_profile") or metadata.get("profile"),
+        "profile_key": metadata.get("profile_key"),
+        "account_mapping": metadata.get("account_mapping"),
+        "did_number": did_number or metadata.get("did_number") or metadata.get("to_number"),
+        "to_number": did_number or metadata.get("to_number"),
+        "caller_phone": caller_phone or metadata.get("caller_phone"),
+        "trunk_id": metadata.get("trunk_id"),
+        "domain": metadata.get("domain"),
+    }
+    params = {key: value for key, value in params.items() if value}
+    headers = {
+        "Accept": "application/json",
+        "ngrok-skip-browser-warning": "true",
+    }
+    if secret:
+        headers["X-Voice-Agent-Secret"] = secret
+
+    url = f"{base_url}/api/method/vobiz_ai.api.voice_agent.get_config"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=8) as response:
+                if response.status != 200:
+                    logger.error("Frappe voice config status %s: %s", response.status, await response.text())
+                    return {"enabled": False, "config_error": f"Frappe status {response.status}"}
+                payload = await response.json()
+                config = payload.get("message") if isinstance(payload, dict) else payload
+                if isinstance(config, dict) and config.get("enabled", True):
+                    logger.info(
+                        "Loaded Frappe voice config: profile=%s account_mapping=%s account_prompt=%s",
+                        config.get("voice_agent_profile") or config.get("agent_name"),
+                        config.get("account_mapping"),
+                        config.get("using_account_prompt"),
+                    )
+                    return config
+                logger.error("Frappe voice config is disabled or invalid: %s", config)
+                return {"enabled": False, "config_error": "Frappe config disabled or invalid"}
+    except Exception as e:
+        logger.exception("Failed to fetch Frappe voice config: %s", e)
+    return {"enabled": False, "config_error": "Frappe config fetch failed"}
+
+
 class Assistant(Agent):
-    def __init__(self, caller_phone: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        caller_phone: Optional[str] = None,
+        instructions_override: Optional[str] = None,
+        agent_name: str = DEFAULT_AGENT_NAME,
+        lead_tool_name: str = "mcp_create_lead",
+    ) -> None:
         self.pending_tasks = []
+        self.lead_tool_name = lead_tool_name or "mcp_create_lead"
         phone_info = ""
         if caller_phone:
             phone_info = (
@@ -100,9 +193,9 @@ class Assistant(Agent):
                 f"use this number directly. Do NOT ask them for their phone number unless they explicitly "
                 f"ask to register a different number instead."
             )
-            
-        super().__init__(
-            instructions=f"""You are KAMAL, SRIAAS virtual care coordinator for Male Infertility and men's sexual health leads.
+
+        display_name = agent_name or DEFAULT_AGENT_NAME
+        default_instructions = f"""You are {display_name}, SRIAAS virtual care coordinator for Male Infertility and men's sexual health leads.
 
 Your job is to understand the patient's concern, collect only the needed details, guide them safely, and move serious or interested cases to doctor callback, consultation, or clinic visit.
 
@@ -116,14 +209,14 @@ You are not a doctor. Do not diagnose, prescribe, guarantee results, or claim cu
 - Ask one or two useful questions at a time.
 - If the customer asks for call, callback, appointment, clinic visit, or doctor, move to callback/appointment flow.
 - If the customer has already shared phone number/name in chat metadata or conversation, do not ask again unless missing.
-- Never say "main doctor hoon." Say: "Main KAMAL, SRIAAS ka virtual care coordinator hoon."
+- Never say "main doctor hoon." Say: "Main {display_name}, SRIAAS ka virtual care coordinator hoon."
 - Avoid vulgar wording. For sexual concerns, use respectful terms like "erection quality", "dhilapan", "sheeghrapatan", "sexual health", "ling se related problem".
 
 ## Conversation Flow
 1. Greeting/new lead:
    - If message is only "Hello", "Hi", "Info", or "Can I get more info?", ask a guided MI-specific question.
    - Preferred reply:
-     "Namaste, main KAMAL SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
+     "Namaste, main {display_name} SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
 
 2. Concern identified:
    - Acknowledge concern.
@@ -304,7 +397,7 @@ Out-of-India service query:
 
 ## Response Examples
 Generic ad lead:
-"Namaste, main KAMAL SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
+"Namaste, main {display_name} SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
 
 Customer: "Reports nhi hai sir"
 "Koi baat nahi sir. Report nahi hai to bhi aap symptoms bata sakte hain. Problem kab se hai aur main issue kya hai?"
@@ -322,7 +415,7 @@ Customer hesitates to share address:
 "Samajh sakta hoon sir. Address sirf doctor-team record aur medicine courier ke liye chahiye. Payment delivery ke time 100% Cash on Delivery rahega."
 
 Customer asks "Aap doctor ho?"
-"Nahi sir, main KAMAL, SRIAAS ka virtual care coordinator hoon. Doctor team aapko medical guidance degi; main aapka case sahi team tak forward karwata hoon."
+"Nahi sir, main {display_name}, SRIAAS ka virtual care coordinator hoon. Doctor team aapko medical guidance degi; main aapka case sahi team tak forward karwata hoon."
 
 Low sperm count/report:
 "Report mil gayi sir. Isme sperm count/motility low dikh rahi hai. Final guidance doctor review ke baad hi milegi. Kya main aapke liye doctor callback arrange kar doon?"
@@ -337,8 +430,13 @@ Clinic address:
 "SRIAAS clinic address: B-92, near Millennium City Centre Metro Station, Sushant Lok Phase I, Sector 43, Gurugram, Haryana 122009. Aap visit karna chahte hain? Main appointment/callback arrange kar sakta hoon."
 
 Serious post-operation concern:
-"Yeh serious lag raha hai sir. Kripya nearest hospital/emergency doctor ko turant dikhaiye. Saath hi main aapka case SRIAAS doctor team ko urgent basis par forward kar raha hoon.""",
-        )
+"Yeh serious lag raha hai sir. Kripya nearest hospital/emergency doctor ko turant dikhaiye. Saath hi main aapka case SRIAAS doctor team ko urgent basis par forward kar raha hoon."""
+
+        instructions = instructions_override or default_instructions
+        if phone_info:
+            instructions = f"{instructions}\n{phone_info}"
+
+        super().__init__(instructions=instructions)
 
     @function_tool
     async def create_lead(
@@ -413,7 +511,7 @@ Serious post-operation concern:
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": "mcp_create_lead",
+                    "name": self.lead_tool_name,
                     "arguments": data
                 }
             }
@@ -506,20 +604,83 @@ async def entrypoint(ctx: JobContext):
     use_vertex = True
     logger.info("Using platform choice: Vertex AI (enforced by agent configuration)")
 
+    # Wait briefly for participant metadata to sync (up to 2 seconds)
+    import asyncio
+    for _ in range(20):
+        if ctx.room.remote_participants:
+            break
+        await asyncio.sleep(0.1)
+
+    # Extract caller ID and dialed DID from SIP participant attributes if available.
+    caller_phone = None
+    did_number = None
+    trunk_id = None
+    for p in ctx.room.remote_participants.values():
+        attrs = getattr(p, "attributes", {}) or {}
+        caller_phone = attrs.get("sip.phoneNumber") or caller_phone
+        did_number = attrs.get("sip.trunkPhoneNumber") or attrs.get("vobiz.did_number") or did_number
+        trunk_id = attrs.get("sip.trunkID") or trunk_id
+        identity = p.identity
+        if caller_phone:
+            break
+        if identity.startswith("sip_"):
+            caller_phone = identity.replace("sip_", "")
+            if caller_phone.startswith("00"):
+                caller_phone = "+" + caller_phone[2:]
+            break
+        elif identity.startswith("+") or identity.isdigit():
+            caller_phone = identity
+            break
+
+    # Fallback: Extract phone number from the room name pattern
+    if not caller_phone and ctx.room.name:
+        import re
+        match = re.search(r'(?:livekit_demo|gemini_live|vobiz)_(\d+)_', ctx.room.name)
+        if match:
+            raw_phone = match.group(1)
+            if raw_phone.startswith("00"):
+                caller_phone = "+" + raw_phone[2:]
+            else:
+                caller_phone = "+" + raw_phone
+
+    metadata = _load_job_metadata(ctx)
+    did_number = did_number or metadata.get("did_number") or metadata.get("to_number")
+    if trunk_id and not metadata.get("trunk_id"):
+        metadata["trunk_id"] = trunk_id
+    config = await fetch_frappe_voice_config(caller_phone=caller_phone, did_number=did_number, metadata=metadata)
+    if config.get("enabled") is False:
+        logger.error("Frappe voice profile was not loaded; using configuration failure prompt only: %s", config.get("config_error"))
+        config = {
+            "agent_name": "Voice Configuration Error",
+            "system_prompt": CONFIG_LOAD_FAILURE_PROMPT,
+            "greeting_instruction": CONFIG_LOAD_FAILURE_GREETING,
+        }
+    gemini_config = config.get("gemini") or {}
+    mcp_config = config.get("mcp") or {}
+
+    for env_name, value in (
+        ("MCP_SERVER_URL", mcp_config.get("server_url")),
+        ("MCP_BEARER_TOKEN", mcp_config.get("bearer_token")),
+        ("GOOGLE_CLOUD_PROJECT", gemini_config.get("google_cloud_project")),
+    ):
+        if value:
+            os.environ[env_name] = value
+
     # Configure Gemini Live model name
-    model_name = os.getenv("GEMINI_LIVE_MODEL")
+    model_name = gemini_config.get("model") or os.getenv("GEMINI_LIVE_MODEL")
     if not model_name:
         if use_vertex:
             model_name = "gemini-live-2.5-flash-native-audio"
         else:
             model_name = "gemini-2.5-flash-native-audio-preview-12-2025"
+    voice_name = gemini_config.get("voice") or os.getenv("GEMINI_LIVE_VOICE") or "Puck"
 
     if use_vertex:
-        vertex_location = os.getenv("VERTEX_LOCATION", "us-central1")
+        vertex_location = gemini_config.get("vertex_location") or os.getenv("VERTEX_LOCATION", "us-central1")
         logger.info(f"Configuring Gemini Live RealtimeModel using Vertex AI ({vertex_location}) with model {model_name}")
         model = realtime.RealtimeModel(
             model=model_name,
-            voice="Puck",
+            voice=voice_name,
             vertexai=True,
             project=os.getenv("GOOGLE_CLOUD_PROJECT"),
             location=vertex_location,
@@ -529,7 +690,7 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"Configuring Gemini Live RealtimeModel using Gemini Developer API (AI Studio) with model {model_name}")
         model = realtime.RealtimeModel(
             model=model_name,
-            voice="Puck",
+            voice=voice_name,
             api_key=os.getenv("GOOGLE_API_KEY"),
             temperature=0.8,
         )
@@ -552,48 +713,6 @@ async def entrypoint(ctx: JobContext):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
-    async def log_usage():
-        """Log usage summary and await any background tasks on shutdown."""
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-        if hasattr(assistant, "pending_tasks") and assistant.pending_tasks:
-            logger.info(f"Awaiting {len(assistant.pending_tasks)} pending CRM submission tasks on shutdown...")
-            import asyncio
-            await asyncio.gather(*assistant.pending_tasks, return_exceptions=True)
-
-    ctx.add_shutdown_callback(log_usage)
-
-    # Wait briefly for participant metadata to sync (up to 2 seconds)
-    import asyncio
-    for _ in range(20):
-        if ctx.room.remote_participants:
-            break
-        await asyncio.sleep(0.1)
-
-    # Extract caller ID from room participants if available
-    caller_phone = None
-    for p in ctx.room.remote_participants.values():
-        identity = p.identity
-        if identity.startswith("sip_"):
-            caller_phone = identity.replace("sip_", "")
-            if caller_phone.startswith("00"):
-                caller_phone = "+" + caller_phone[2:]
-            break
-        elif identity.startswith("+") or identity.isdigit():
-            caller_phone = identity
-            break
-
-    # Fallback: Extract phone number from the room name pattern
-    if not caller_phone and ctx.room.name:
-        import re
-        match = re.search(r'livekit_demo_(\d+)_', ctx.room.name)
-        if match:
-            raw_phone = match.group(1)
-            if raw_phone.startswith("00"):
-                caller_phone = "+" + raw_phone[2:]
-            else:
-                caller_phone = "+" + raw_phone
-
     # Initialize telephony noise cancellation if available
     nc = None
     try:
@@ -603,8 +722,24 @@ async def entrypoint(ctx: JobContext):
     except Exception as e:
         logger.warning(f"Could not load noise cancellation plugin: {e}")
 
-    # Start the session with Riya assistant
-    assistant = Assistant(caller_phone=caller_phone)
+    # Start the session with the Frappe-selected voice profile.
+    assistant = Assistant(
+        caller_phone=caller_phone,
+        instructions_override=config.get("system_prompt"),
+        agent_name=config.get("agent_name") or DEFAULT_AGENT_NAME,
+        lead_tool_name=mcp_config.get("lead_creation_tool_name") or "mcp_create_lead",
+    )
+
+    async def log_usage():
+        """Log usage summary and await any background tasks on shutdown."""
+        summary = usage_collector.get_summary()
+        logger.info(f"Usage: {summary}")
+        if hasattr(assistant, "pending_tasks") and assistant.pending_tasks:
+            logger.info(f"Awaiting {len(assistant.pending_tasks)} pending CRM submission tasks on shutdown...")
+            await asyncio.gather(*assistant.pending_tasks, return_exceptions=True)
+
+    ctx.add_shutdown_callback(log_usage)
+
     await session.start(
         agent=assistant,
         room=ctx.room,
@@ -619,9 +754,15 @@ async def entrypoint(ctx: JobContext):
 
     # Trigger the agent to speak first!
     await session.generate_reply(
-        instructions="The call has just connected. Immediately greet the customer warmly in Hindi and introduce yourself and SRIAAS."
+        instructions=config.get("greeting_instruction") or DEFAULT_GREETING_INSTRUCTION
     )
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+            agent_name=os.getenv("LIVEKIT_AGENT_NAME", "vobiz-gemini-live"),
+        )
+    )

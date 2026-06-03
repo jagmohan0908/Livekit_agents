@@ -107,16 +107,38 @@ def clean_phone_number(phone_str: str) -> str:
 
 
 def _load_job_metadata(ctx: JobContext) -> dict:
-    job = getattr(ctx, "job", None)
-    raw_metadata = getattr(job, "metadata", "") if job else ""
-    if not raw_metadata:
-        return {}
-    try:
-        data = json.loads(raw_metadata)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        logger.warning("LiveKit job metadata is not valid JSON: %s", raw_metadata)
-        return {}
+    metadata = {}
+    candidates = [
+        getattr(getattr(ctx, "job", None), "metadata", None),
+        getattr(getattr(ctx, "_info", None), "accept_arguments", None),
+        getattr(getattr(ctx, "room", None), "metadata", None),
+    ]
+    for candidate in candidates:
+        raw_metadata = getattr(candidate, "metadata", candidate)
+        if not raw_metadata:
+            continue
+        try:
+            data = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
+            if isinstance(data, dict):
+                metadata.update(data)
+        except Exception:
+            logger.warning("LiveKit metadata is not valid JSON: %s", raw_metadata)
+    return metadata
+
+
+def _load_participant_metadata(ctx: JobContext) -> dict:
+    metadata = {}
+    for participant in ctx.room.remote_participants.values():
+        raw_metadata = getattr(participant, "metadata", "")
+        if not raw_metadata:
+            continue
+        try:
+            data = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
+            if isinstance(data, dict):
+                metadata.update(data)
+        except Exception:
+            logger.warning("Participant metadata is not valid JSON: %s", raw_metadata)
+    return metadata
 
 
 async def fetch_frappe_voice_config(
@@ -127,7 +149,12 @@ async def fetch_frappe_voice_config(
     """Fetch the active voice profile from Frappe."""
     import aiohttp
 
-    base_url = (os.getenv("FRAPPE_BASE_URL") or os.getenv("VOBIZ_AI_BASE_URL") or "").rstrip("/")
+    base_url = (
+        metadata.get("frappe_base_url")
+        or os.getenv("FRAPPE_BASE_URL")
+        or os.getenv("VOBIZ_AI_BASE_URL")
+        or ""
+    ).rstrip("/")
     secret = os.getenv("VOICE_AGENT_CONFIG_SECRET") or os.getenv("X_VOICE_AGENT_SECRET") or ""
     if not base_url:
         logger.info("FRAPPE_BASE_URL is not configured; using local agent prompt.")
@@ -142,6 +169,7 @@ async def fetch_frappe_voice_config(
         "caller_phone": caller_phone or metadata.get("caller_phone"),
         "trunk_id": metadata.get("trunk_id"),
         "domain": metadata.get("domain"),
+        "company_key": metadata.get("company_key"),
     }
     params = {key: value for key, value in params.items() if value}
     headers = {
@@ -151,7 +179,7 @@ async def fetch_frappe_voice_config(
     if secret:
         headers["X-Voice-Agent-Secret"] = secret
 
-    url = f"{base_url}/api/method/vobiz_ai.api.voice_agent.get_config"
+    url = f"{base_url}/api/method/vobiz_ai.api.voice_agent.get_voice_agent_config"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers, timeout=8) as response:
@@ -162,10 +190,12 @@ async def fetch_frappe_voice_config(
                 config = payload.get("message") if isinstance(payload, dict) else payload
                 if isinstance(config, dict) and config.get("enabled", True):
                     logger.info(
-                        "Loaded Frappe voice config: profile=%s account_mapping=%s account_prompt=%s",
+                        "Loaded Frappe voice config: company=%s profile=%s account_mapping=%s account_prompt=%s base_url=%s",
+                        metadata.get("company_key") or "",
                         config.get("voice_agent_profile") or config.get("agent_name"),
                         config.get("account_mapping"),
                         config.get("using_account_prompt"),
+                        base_url,
                     )
                     return config
                 logger.error("Frappe voice config is disabled or invalid: %s", config)
@@ -644,10 +674,17 @@ async def entrypoint(ctx: JobContext):
                 caller_phone = "+" + raw_phone
 
     metadata = _load_job_metadata(ctx)
+    metadata.update(_load_participant_metadata(ctx))
     did_number = did_number or metadata.get("did_number") or metadata.get("to_number")
     if trunk_id and not metadata.get("trunk_id"):
         metadata["trunk_id"] = trunk_id
     config = await fetch_frappe_voice_config(caller_phone=caller_phone, did_number=did_number, metadata=metadata)
+    ctx.log_context_fields.update(
+        {
+            "company_key": metadata.get("company_key") or "",
+            "profile_key": metadata.get("profile_key") or config.get("profile_key") or "",
+        }
+    )
     if config.get("enabled") is False:
         logger.error("Frappe voice profile was not loaded; using configuration failure prompt only: %s", config.get("config_error"))
         config = {

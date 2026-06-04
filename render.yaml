@@ -13,7 +13,7 @@ services:
       - key: LIVEKIT_API_SECRET
         sync: false
       - key: LIVEKIT_AGENT_NAME
-        value: vobiz-gemini-live
+        sync: false
       - key: FRAPPE_BASE_URL
         sync: false
       - key: VOICE_AGENT_CONFIG_SECRET

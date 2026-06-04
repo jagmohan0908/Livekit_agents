@@ -75,6 +75,44 @@ LiveKit Cloud -> Agents
 No manual LiveKit Agent Builder setup is required. Frappe is the source of truth
 for prompts, greeting, model, voice, guardrails, and profile routing.
 
+## Live Call Actions
+
+The worker can call a secure Frappe action endpoint during a live call:
+
+```text
+/api/method/vobiz_ai.api.voice_actions.perform_voice_action
+```
+
+It uses the same shared header as config loading:
+
+```text
+X-Voice-Agent-Secret: VOICE_AGENT_CONFIG_SECRET
+```
+
+Supported actions:
+
+```text
+send_whatsapp
+book_appointment_request
+arrange_doctor_callback
+create_issue
+```
+
+Enable actions per profile in Frappe:
+
+```text
+Vobiz Voice Agent Profile -> Allowed Voice Actions
+```
+
+Example:
+
+```text
+send_whatsapp,book_appointment_request,arrange_doctor_callback,create_issue
+```
+
+The worker only exposes actions returned by Frappe config, and Frappe rejects
+any action not allowed on that voice profile.
+
 ## Render Deployment
 
 Create one Render Background Worker per company from this repository.

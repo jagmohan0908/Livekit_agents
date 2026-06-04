@@ -205,6 +205,58 @@ async def fetch_frappe_voice_config(
     return {"enabled": False, "config_error": "Frappe config fetch failed"}
 
 
+async def post_frappe_voice_action(
+    *,
+    metadata: dict,
+    caller_phone: Optional[str],
+    did_number: Optional[str],
+    action_payload: dict,
+) -> dict:
+    import aiohttp
+
+    base_url = (
+        metadata.get("frappe_base_url")
+        or os.getenv("FRAPPE_BASE_URL")
+        or os.getenv("VOBIZ_AI_BASE_URL")
+        or ""
+    ).rstrip("/")
+    secret = os.getenv("VOICE_AGENT_CONFIG_SECRET") or os.getenv("X_VOICE_AGENT_SECRET") or ""
+    if not base_url:
+        return {"success": False, "error": "Frappe base URL is not configured"}
+
+    payload = {
+        **(action_payload or {}),
+        "voice_agent_profile": metadata.get("voice_agent_profile") or metadata.get("profile"),
+        "profile_key": metadata.get("profile_key"),
+        "did_number": did_number or metadata.get("did_number") or metadata.get("to_number"),
+        "caller_phone": caller_phone or metadata.get("caller_phone"),
+        "trunk_id": metadata.get("trunk_id"),
+        "company_key": metadata.get("company_key"),
+    }
+    payload = {key: value for key, value in payload.items() if value not in (None, "")}
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "true",
+    }
+    if secret:
+        headers["X-Voice-Agent-Secret"] = secret
+
+    url = f"{base_url}/api/method/vobiz_ai.api.voice_actions.perform_voice_action"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload, timeout=8) as response:
+                text = await response.text()
+                if response.status != 200:
+                    logger.error("Frappe voice action status %s: %s", response.status, text)
+                    return {"success": False, "error": f"Frappe status {response.status}", "detail": text[:500]}
+                data = json.loads(text) if text else {}
+                return data.get("message") if isinstance(data, dict) and "message" in data else data
+    except Exception as e:
+        logger.exception("Failed to run Frappe voice action: %s", e)
+        return {"success": False, "error": "Frappe voice action failed"}
+
+
 class Assistant(Agent):
     def __init__(
         self,
@@ -212,9 +264,16 @@ class Assistant(Agent):
         instructions_override: Optional[str] = None,
         agent_name: str = DEFAULT_AGENT_NAME,
         lead_tool_name: str = "mcp_create_lead",
+        metadata: Optional[dict] = None,
+        did_number: Optional[str] = None,
+        allowed_actions: Optional[list[str]] = None,
     ) -> None:
         self.pending_tasks = []
         self.lead_tool_name = lead_tool_name or "mcp_create_lead"
+        self.metadata = metadata or {}
+        self.caller_phone = caller_phone
+        self.did_number = did_number
+        self.allowed_actions = {str(action).strip() for action in (allowed_actions or []) if str(action).strip()}
         phone_info = ""
         if caller_phone:
             phone_info = (
@@ -465,8 +524,66 @@ Serious post-operation concern:
         instructions = instructions_override or default_instructions
         if phone_info:
             instructions = f"{instructions}\n{phone_info}"
+        if self.allowed_actions:
+            actions = ", ".join(sorted(self.allowed_actions))
+            instructions = (
+                f"{instructions}\n\n## Live Call Actions\n"
+                f"- You may use only these backend actions when the caller clearly asks or agrees: {actions}.\n"
+                "- For clinic address/location on WhatsApp, call perform_voice_action with action_type='send_whatsapp' and include the exact message body.\n"
+                "- For appointment booking requests, call perform_voice_action with action_type='book_appointment_request' and include reason and preferred_time if known.\n"
+                "- For doctor callback requests, call perform_voice_action with action_type='arrange_doctor_callback' and include reason and preferred_time if known.\n"
+                "- For complaints, special requests, or unresolved queries, call perform_voice_action with action_type='create_issue' and include a short reason.\n"
+                "- Do not claim the action is completed until the tool returns success. If it is queued, tell the caller it has been forwarded/queued."
+            )
 
         super().__init__(instructions=instructions)
+
+    @function_tool
+    async def perform_voice_action(
+        self,
+        context: RunContext,
+        action_type: str,
+        reason: Optional[str] = "",
+        message: Optional[str] = "",
+        preferred_time: Optional[str] = "",
+        details: Optional[str] = "",
+    ) -> str:
+        """Run an approved Frappe action during the live call.
+
+        Use this when the caller asks for WhatsApp information, appointment booking,
+        doctor callback, or when a query/complaint should be logged.
+
+        Args:
+            action_type: One of send_whatsapp, book_appointment_request, arrange_doctor_callback, create_issue.
+            reason: Short reason for the action.
+            message: Exact WhatsApp text to send for send_whatsapp.
+            preferred_time: Preferred appointment/callback time if the caller shared it.
+            details: Extra short context from the call.
+        """
+        action = (action_type or "").strip()
+        if not action:
+            return "Action failed: action_type is required."
+        if self.allowed_actions and action not in self.allowed_actions:
+            return f"Action failed: {action} is not allowed for this voice profile."
+
+        payload = {
+            "action": action,
+            "reason": reason or message or details,
+            "message": message,
+            "preferred_time": preferred_time,
+            "details": details,
+        }
+        result = await post_frappe_voice_action(
+            metadata=self.metadata,
+            caller_phone=self.caller_phone,
+            did_number=self.did_number,
+            action_payload=payload,
+        )
+        if result.get("success"):
+            if result.get("queued"):
+                return "Action queued successfully. Tell the caller it has been sent/forwarded."
+            return "Action completed successfully. Tell the caller briefly."
+        return f"Action failed: {result.get('error') or result.get('detail') or 'unknown error'}"
 
     @function_tool
     async def create_lead(
@@ -765,6 +882,9 @@ async def entrypoint(ctx: JobContext):
         instructions_override=config.get("system_prompt"),
         agent_name=config.get("agent_name") or DEFAULT_AGENT_NAME,
         lead_tool_name=mcp_config.get("lead_creation_tool_name") or "mcp_create_lead",
+        metadata=metadata,
+        did_number=did_number,
+        allowed_actions=(config.get("guardrails") or {}).get("allowed_actions") or [],
     )
 
     async def log_usage():

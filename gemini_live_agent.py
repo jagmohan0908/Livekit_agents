@@ -174,6 +174,7 @@ async def fetch_frappe_voice_config(
 ) -> dict:
     """Fetch the active voice profile from Frappe."""
     import aiohttp
+    import asyncio
 
     base_url = (
         metadata.get("frappe_base_url")
@@ -206,28 +207,36 @@ async def fetch_frappe_voice_config(
         headers["X-Voice-Agent-Secret"] = secret
 
     url = f"{base_url}/api/method/vobiz_ai.api.voice_agent.get_voice_agent_config"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=8) as response:
-                if response.status != 200:
-                    logger.error("Frappe voice config status %s: %s", response.status, await response.text())
-                    return {"enabled": False, "config_error": f"Frappe status {response.status}"}
-                payload = await response.json()
-                config = payload.get("message") if isinstance(payload, dict) else payload
-                if isinstance(config, dict) and config.get("enabled", True):
-                    logger.info(
-                        "Loaded Frappe voice config: company=%s profile=%s account_mapping=%s account_prompt=%s base_url=%s",
-                        metadata.get("company_key") or "",
-                        config.get("voice_agent_profile") or config.get("agent_name"),
-                        config.get("account_mapping"),
-                        config.get("using_account_prompt"),
-                        base_url,
-                    )
-                    return config
-                logger.error("Frappe voice config is disabled or invalid: %s", config)
-                return {"enabled": False, "config_error": "Frappe config disabled or invalid"}
-    except Exception as e:
-        logger.exception("Failed to fetch Frappe voice config: %s", e)
+    timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, params=params, headers=headers) as response:
+                    if response.status != 200:
+                        logger.error("Frappe voice config status %s: %s", response.status, await response.text())
+                        return {"enabled": False, "config_error": f"Frappe status {response.status}"}
+                    payload = await response.json()
+                    config = payload.get("message") if isinstance(payload, dict) else payload
+                    if isinstance(config, dict) and config.get("enabled", True):
+                        logger.info(
+                            "Loaded Frappe voice config: company=%s profile=%s account_mapping=%s account_prompt=%s base_url=%s",
+                            metadata.get("company_key") or "",
+                            config.get("voice_agent_profile") or config.get("agent_name"),
+                            config.get("account_mapping"),
+                            config.get("using_account_prompt"),
+                            base_url,
+                        )
+                        return config
+                    logger.error("Frappe voice config is disabled or invalid: %s", config)
+                    return {"enabled": False, "config_error": "Frappe config disabled or invalid"}
+        except Exception as e:
+            last_error = e
+            logger.warning("Frappe voice config fetch attempt %s failed: %s", attempt, e)
+            if attempt < 3:
+                await asyncio.sleep(0.5 * attempt)
+    if last_error:
+        logger.error("Failed to fetch Frappe voice config after retries: %s", last_error)
     return {"enabled": False, "config_error": "Frappe config fetch failed"}
 
 
@@ -902,8 +911,9 @@ async def entrypoint(ctx: JobContext):
     nc = None
     try:
         from livekit.plugins import noise_cancellation
-        nc = noise_cancellation.BVCTelephony()
-        logger.info("Enabling BVCTelephony noise cancellation for the room session.")
+        if os.getenv("ENABLE_LIVEKIT_NOISE_CANCELLATION", "").strip().lower() in {"1", "true", "yes"}:
+            nc = noise_cancellation.BVCTelephony()
+            logger.info("Enabling BVCTelephony noise cancellation for the room session.")
     except Exception as e:
         logger.warning(f"Could not load noise cancellation plugin: {e}")
 

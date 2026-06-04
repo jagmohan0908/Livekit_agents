@@ -167,6 +167,24 @@ def _load_participant_metadata(ctx: JobContext) -> dict:
     return metadata
 
 
+def _frappe_base_url_candidates(base_url: str) -> list[str]:
+    """Return preferred Frappe base URLs without requiring dispatch metadata edits."""
+    base_url = (base_url or "").rstrip("/")
+    if not base_url:
+        return []
+
+    candidates = []
+    if base_url.startswith("http://") and not re.match(r"^http://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$", base_url):
+        candidates.append("https://" + base_url[len("http://"):])
+    candidates.append(base_url)
+
+    unique_candidates = []
+    for candidate in candidates:
+        if candidate and candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
 async def fetch_frappe_voice_config(
     caller_phone: Optional[str],
     did_number: Optional[str],
@@ -176,14 +194,15 @@ async def fetch_frappe_voice_config(
     import aiohttp
     import asyncio
 
-    base_url = (
+    configured_base_url = (
         metadata.get("frappe_base_url")
         or os.getenv("FRAPPE_BASE_URL")
         or os.getenv("VOBIZ_AI_BASE_URL")
         or ""
     ).rstrip("/")
     secret = os.getenv("VOICE_AGENT_CONFIG_SECRET") or os.getenv("X_VOICE_AGENT_SECRET") or ""
-    if not base_url:
+    base_urls = _frappe_base_url_candidates(configured_base_url)
+    if not base_urls:
         logger.info("FRAPPE_BASE_URL is not configured; using local agent prompt.")
         return {}
 
@@ -206,35 +225,36 @@ async def fetch_frappe_voice_config(
     if secret:
         headers["X-Voice-Agent-Secret"] = secret
 
-    url = f"{base_url}/api/method/vobiz_ai.api.voice_agent.get_voice_agent_config"
     timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
     last_error = None
-    for attempt in range(1, 4):
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, params=params, headers=headers) as response:
-                    if response.status != 200:
-                        logger.error("Frappe voice config status %s: %s", response.status, await response.text())
-                        return {"enabled": False, "config_error": f"Frappe status {response.status}"}
-                    payload = await response.json()
-                    config = payload.get("message") if isinstance(payload, dict) else payload
-                    if isinstance(config, dict) and config.get("enabled", True):
-                        logger.info(
-                            "Loaded Frappe voice config: company=%s profile=%s account_mapping=%s account_prompt=%s base_url=%s",
-                            metadata.get("company_key") or "",
-                            config.get("voice_agent_profile") or config.get("agent_name"),
-                            config.get("account_mapping"),
-                            config.get("using_account_prompt"),
-                            base_url,
-                        )
-                        return config
-                    logger.error("Frappe voice config is disabled or invalid: %s", config)
-                    return {"enabled": False, "config_error": "Frappe config disabled or invalid"}
-        except Exception as e:
-            last_error = e
-            logger.warning("Frappe voice config fetch attempt %s failed: %s", attempt, e)
-            if attempt < 3:
-                await asyncio.sleep(0.5 * attempt)
+    for base_url in base_urls:
+        url = f"{base_url}/api/method/vobiz_ai.api.voice_agent.get_voice_agent_config"
+        for attempt in range(1, 4):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url, params=params, headers=headers) as response:
+                        if response.status != 200:
+                            logger.error("Frappe voice config status %s from %s: %s", response.status, base_url, await response.text())
+                            return {"enabled": False, "config_error": f"Frappe status {response.status}"}
+                        payload = await response.json()
+                        config = payload.get("message") if isinstance(payload, dict) else payload
+                        if isinstance(config, dict) and config.get("enabled", True):
+                            logger.info(
+                                "Loaded Frappe voice config: company=%s profile=%s account_mapping=%s account_prompt=%s base_url=%s",
+                                metadata.get("company_key") or "",
+                                config.get("voice_agent_profile") or config.get("agent_name"),
+                                config.get("account_mapping"),
+                                config.get("using_account_prompt"),
+                                base_url,
+                            )
+                            return config
+                        logger.error("Frappe voice config is disabled or invalid: %s", config)
+                        return {"enabled": False, "config_error": "Frappe config disabled or invalid"}
+            except Exception as e:
+                last_error = e
+                logger.warning("Frappe voice config fetch attempt %s failed for %s: %s", attempt, base_url, e)
+                if attempt < 3:
+                    await asyncio.sleep(0.5 * attempt)
     if last_error:
         logger.error("Failed to fetch Frappe voice config after retries: %s", last_error)
     return {"enabled": False, "config_error": "Frappe config fetch failed"}

@@ -32,9 +32,35 @@ def configure_google_credentials() -> None:
     """Support Render secret env var containing the full service account JSON."""
     credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if credentials_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        raw_credentials = credentials_json.strip()
+        if (
+            (raw_credentials.startswith("'") and raw_credentials.endswith("'"))
+            or (raw_credentials.startswith('"') and raw_credentials.endswith('"'))
+        ):
+            raw_credentials = raw_credentials[1:-1].strip()
+
+        # Render/env files are easy to misconfigure with backslash-newline
+        # continuations inside private_key. Normalize that into JSON-safe \n.
+        candidates = [
+            raw_credentials,
+            raw_credentials.replace("\\\r\n", "\\n").replace("\\\n", "\\n"),
+        ]
+        parsed_credentials = None
+        last_error = None
+        for candidate in candidates:
+            try:
+                parsed_credentials = json.loads(candidate)
+                if isinstance(parsed_credentials, str):
+                    parsed_credentials = json.loads(parsed_credentials)
+                break
+            except json.JSONDecodeError as exc:
+                last_error = exc
+        if not isinstance(parsed_credentials, dict):
+            raise ValueError(f"GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: {last_error}")
+
         credentials_path = os.path.join(tempfile.gettempdir(), "google-credentials.json")
         with open(credentials_path, "w", encoding="utf-8") as f:
-            f.write(credentials_json)
+            json.dump(parsed_credentials, f)
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
         logger.info("Google credentials configured from GOOGLE_APPLICATION_CREDENTIALS_JSON")
 

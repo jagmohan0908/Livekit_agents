@@ -777,6 +777,11 @@ async def entrypoint(ctx: JobContext):
     use_vertex = True
     logger.info("Using platform choice: Vertex AI (enforced by agent configuration)")
 
+    # Join the LiveKit room before reading SIP participant state or starting
+    # the agent session. Telephony calls can otherwise connect at SIP level
+    # while the agent audio pipeline is not attached to the room yet.
+    await ctx.connect()
+
     # Wait briefly for participant metadata to sync (up to 2 seconds)
     import asyncio
     for _ in range(20):
@@ -927,13 +932,10 @@ async def entrypoint(ctx: JobContext):
         agent=assistant,
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            video_enabled=True,
+            video_enabled=False,
             noise_cancellation=nc
         ),
     )
-
-    # Connect to the room
-    await ctx.connect()
 
     # Trigger the agent to speak first!
     await session.generate_reply(

@@ -2,8 +2,6 @@ import logging
 import datetime
 import os
 import re
-import tempfile
-import json
 from typing import Optional
 from dotenv import load_dotenv
 from livekit.agents import (
@@ -26,68 +24,10 @@ from livekit.plugins.google.beta import realtime
 logger = logging.getLogger("gemini_live_agent")
 
 load_dotenv(".env.local")
-
-
-def configure_google_credentials() -> None:
-    """Support Render secret env var containing the full service account JSON."""
-    credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
-    if credentials_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
-        raw_credentials = credentials_json.strip()
-        if (
-            (raw_credentials.startswith("'") and raw_credentials.endswith("'"))
-            or (raw_credentials.startswith('"') and raw_credentials.endswith('"'))
-        ):
-            raw_credentials = raw_credentials[1:-1].strip()
-
-        # Render/env files are easy to misconfigure with backslash-newline
-        # continuations inside private_key. Normalize that into JSON-safe \n.
-        candidates = [
-            raw_credentials,
-            raw_credentials.replace("\\\r\n", "\\n").replace("\\\n", "\\n"),
-        ]
-        parsed_credentials = None
-        last_error = None
-        for candidate in candidates:
-            try:
-                parsed_credentials = json.loads(candidate)
-                if isinstance(parsed_credentials, str):
-                    parsed_credentials = json.loads(parsed_credentials)
-                break
-            except json.JSONDecodeError as exc:
-                last_error = exc
-        if not isinstance(parsed_credentials, dict):
-            raise ValueError(f"GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid JSON: {last_error}")
-
-        credentials_path = os.path.join(tempfile.gettempdir(), "google-credentials.json")
-        with open(credentials_path, "w", encoding="utf-8") as f:
-            json.dump(parsed_credentials, f)
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
-        logger.info("Google credentials configured from GOOGLE_APPLICATION_CREDENTIALS_JSON")
-
-
-configure_google_credentials()
-logger.info(
-    "Agent environment loaded: livekit_url_configured=%s google_project_configured=%s mcp_url_configured=%s",
-    bool(os.getenv("LIVEKIT_URL")),
-    bool(os.getenv("GOOGLE_CLOUD_PROJECT")),
-    bool(os.getenv("MCP_SERVER_URL")),
-)
-
-
-DEFAULT_AGENT_NAME = "SRIAAS Assistant"
-DEFAULT_GREETING_INSTRUCTION = (
-    "The call has just connected. Immediately greet the customer warmly in Hindi "
-    "and introduce yourself and SRIAAS."
-)
-CONFIG_LOAD_FAILURE_PROMPT = (
-    "The voice-agent profile could not be loaded from Frappe. Do not use any default "
-    "sales, medical, or identity prompt. Politely say in Hindi that the system is not "
-    "ready for this call and ask the caller to try again later."
-)
-CONFIG_LOAD_FAILURE_GREETING = (
-    "Politely say in Hindi: Maaf kijiye, abhi voice agent configuration load nahi ho paayi. "
-    "Kripya thodi der baad call kijiye."
-)
+print("\n[DEBUG] Environment check:")
+print("LIVEKIT_URL =", os.getenv("LIVEKIT_URL"))
+print("LIVEKIT_API_KEY =", os.getenv("LIVEKIT_API_KEY"))
+print("LIVEKIT_API_SECRET =", os.getenv("LIVEKIT_API_SECRET"))
 
 
 def clean_phone_number(phone_str: str) -> str:
@@ -132,203 +72,9 @@ def clean_phone_number(phone_str: str) -> str:
     return cleaned
 
 
-def _load_job_metadata(ctx: JobContext) -> dict:
-    metadata = {}
-    candidates = [
-        getattr(getattr(ctx, "job", None), "metadata", None),
-        getattr(getattr(ctx, "_info", None), "accept_arguments", None),
-        getattr(getattr(ctx, "room", None), "metadata", None),
-    ]
-    for candidate in candidates:
-        raw_metadata = getattr(candidate, "metadata", candidate)
-        if not raw_metadata:
-            continue
-        try:
-            data = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-            if isinstance(data, dict):
-                metadata.update(data)
-        except Exception:
-            logger.warning("LiveKit metadata is not valid JSON: %s", raw_metadata)
-    return metadata
-
-
-def _load_participant_metadata(ctx: JobContext) -> dict:
-    metadata = {}
-    for participant in ctx.room.remote_participants.values():
-        raw_metadata = getattr(participant, "metadata", "")
-        if not raw_metadata:
-            continue
-        try:
-            data = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-            if isinstance(data, dict):
-                metadata.update(data)
-        except Exception:
-            logger.warning("Participant metadata is not valid JSON: %s", raw_metadata)
-    return metadata
-
-
-def _frappe_base_url_candidates(base_url: str) -> list[str]:
-    """Return preferred Frappe base URLs without requiring dispatch metadata edits."""
-    base_url = (base_url or "").rstrip("/")
-    if not base_url:
-        return []
-
-    candidates = []
-    if base_url.startswith("http://") and not re.match(r"^http://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$", base_url):
-        candidates.append("https://" + base_url[len("http://"):])
-    candidates.append(base_url)
-
-    unique_candidates = []
-    for candidate in candidates:
-        if candidate and candidate not in unique_candidates:
-            unique_candidates.append(candidate)
-    return unique_candidates
-
-
-async def fetch_frappe_voice_config(
-    caller_phone: Optional[str],
-    did_number: Optional[str],
-    metadata: dict,
-) -> dict:
-    """Fetch the active voice profile from Frappe."""
-    import aiohttp
-    import asyncio
-
-    configured_base_url = (
-        metadata.get("frappe_base_url")
-        or os.getenv("FRAPPE_BASE_URL")
-        or os.getenv("VOBIZ_AI_BASE_URL")
-        or ""
-    ).rstrip("/")
-    secret = os.getenv("VOICE_AGENT_CONFIG_SECRET") or os.getenv("X_VOICE_AGENT_SECRET") or ""
-    base_urls = _frappe_base_url_candidates(configured_base_url)
-    if not base_urls:
-        logger.info("FRAPPE_BASE_URL is not configured; using local agent prompt.")
-        return {}
-
-    params = {
-        "voice_agent_profile": metadata.get("voice_agent_profile") or metadata.get("profile"),
-        "profile_key": metadata.get("profile_key"),
-        "account_mapping": metadata.get("account_mapping"),
-        "did_number": did_number or metadata.get("did_number") or metadata.get("to_number"),
-        "to_number": did_number or metadata.get("to_number"),
-        "caller_phone": caller_phone or metadata.get("caller_phone"),
-        "trunk_id": metadata.get("trunk_id"),
-        "domain": metadata.get("domain"),
-        "company_key": metadata.get("company_key"),
-    }
-    params = {key: value for key, value in params.items() if value}
-    headers = {
-        "Accept": "application/json",
-        "ngrok-skip-browser-warning": "true",
-    }
-    if secret:
-        headers["X-Voice-Agent-Secret"] = secret
-
-    timeout = aiohttp.ClientTimeout(total=20, connect=5, sock_read=15)
-    last_error = None
-    for base_url in base_urls:
-        url = f"{base_url}/api/method/vobiz_ai.api.voice_agent.get_voice_agent_config"
-        for attempt in range(1, 4):
-            try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url, params=params, headers=headers) as response:
-                        if response.status != 200:
-                            logger.error("Frappe voice config status %s from %s: %s", response.status, base_url, await response.text())
-                            return {"enabled": False, "config_error": f"Frappe status {response.status}"}
-                        payload = await response.json()
-                        config = payload.get("message") if isinstance(payload, dict) else payload
-                        if isinstance(config, dict) and config.get("enabled", True):
-                            logger.info(
-                                "Loaded Frappe voice config: company=%s profile=%s account_mapping=%s account_prompt=%s base_url=%s",
-                                metadata.get("company_key") or "",
-                                config.get("voice_agent_profile") or config.get("agent_name"),
-                                config.get("account_mapping"),
-                                config.get("using_account_prompt"),
-                                base_url,
-                            )
-                            return config
-                        logger.error("Frappe voice config is disabled or invalid: %s", config)
-                        return {"enabled": False, "config_error": "Frappe config disabled or invalid"}
-            except Exception as e:
-                last_error = e
-                logger.warning("Frappe voice config fetch attempt %s failed for %s: %s", attempt, base_url, e)
-                if attempt < 3:
-                    await asyncio.sleep(0.5 * attempt)
-    if last_error:
-        logger.error("Failed to fetch Frappe voice config after retries: %s", last_error)
-    return {"enabled": False, "config_error": "Frappe config fetch failed"}
-
-
-async def post_frappe_voice_action(
-    *,
-    metadata: dict,
-    caller_phone: Optional[str],
-    did_number: Optional[str],
-    action_payload: dict,
-) -> dict:
-    import aiohttp
-
-    base_url = (
-        metadata.get("frappe_base_url")
-        or os.getenv("FRAPPE_BASE_URL")
-        or os.getenv("VOBIZ_AI_BASE_URL")
-        or ""
-    ).rstrip("/")
-    secret = os.getenv("VOICE_AGENT_CONFIG_SECRET") or os.getenv("X_VOICE_AGENT_SECRET") or ""
-    if not base_url:
-        return {"success": False, "error": "Frappe base URL is not configured"}
-
-    payload = {
-        **(action_payload or {}),
-        "voice_agent_profile": metadata.get("voice_agent_profile") or metadata.get("profile"),
-        "profile_key": metadata.get("profile_key"),
-        "did_number": did_number or metadata.get("did_number") or metadata.get("to_number"),
-        "caller_phone": caller_phone or metadata.get("caller_phone"),
-        "trunk_id": metadata.get("trunk_id"),
-        "company_key": metadata.get("company_key"),
-    }
-    payload = {key: value for key, value in payload.items() if value not in (None, "")}
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "ngrok-skip-browser-warning": "true",
-    }
-    if secret:
-        headers["X-Voice-Agent-Secret"] = secret
-
-    url = f"{base_url}/api/method/vobiz_ai.api.voice_actions.perform_voice_action"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=payload, timeout=8) as response:
-                text = await response.text()
-                if response.status != 200:
-                    logger.error("Frappe voice action status %s: %s", response.status, text)
-                    return {"success": False, "error": f"Frappe status {response.status}", "detail": text[:500]}
-                data = json.loads(text) if text else {}
-                return data.get("message") if isinstance(data, dict) and "message" in data else data
-    except Exception as e:
-        logger.exception("Failed to run Frappe voice action: %s", e)
-        return {"success": False, "error": "Frappe voice action failed"}
-
-
 class Assistant(Agent):
-    def __init__(
-        self,
-        caller_phone: Optional[str] = None,
-        instructions_override: Optional[str] = None,
-        agent_name: str = DEFAULT_AGENT_NAME,
-        lead_tool_name: str = "mcp_create_lead",
-        metadata: Optional[dict] = None,
-        did_number: Optional[str] = None,
-        allowed_actions: Optional[list[str]] = None,
-    ) -> None:
+    def __init__(self, caller_phone: Optional[str] = None) -> None:
         self.pending_tasks = []
-        self.lead_tool_name = lead_tool_name or "mcp_create_lead"
-        self.metadata = metadata or {}
-        self.caller_phone = caller_phone
-        self.did_number = did_number
-        self.allowed_actions = {str(action).strip() for action in (allowed_actions or []) if str(action).strip()}
         phone_info = ""
         if caller_phone:
             phone_info = (
@@ -337,9 +83,9 @@ class Assistant(Agent):
                 f"use this number directly. Do NOT ask them for their phone number unless they explicitly "
                 f"ask to register a different number instead."
             )
-
-        display_name = agent_name or DEFAULT_AGENT_NAME
-        default_instructions = f"""You are {display_name}, SRIAAS virtual care coordinator for Male Infertility and men's sexual health leads.
+            
+        super().__init__(
+            instructions=f"""You are KAMAL, SRIAAS virtual care coordinator for Male Infertility and men's sexual health leads.
 
 Your job is to understand the patient's concern, collect only the needed details, guide them safely, and move serious or interested cases to doctor callback, consultation, or clinic visit.
 
@@ -353,14 +99,14 @@ You are not a doctor. Do not diagnose, prescribe, guarantee results, or claim cu
 - Ask one or two useful questions at a time.
 - If the customer asks for call, callback, appointment, clinic visit, or doctor, move to callback/appointment flow.
 - If the customer has already shared phone number/name in chat metadata or conversation, do not ask again unless missing.
-- Never say "main doctor hoon." Say: "Main {display_name}, SRIAAS ka virtual care coordinator hoon."
+- Never say "main doctor hoon." Say: "Main KAMAL, SRIAAS ka virtual care coordinator hoon."
 - Avoid vulgar wording. For sexual concerns, use respectful terms like "erection quality", "dhilapan", "sheeghrapatan", "sexual health", "ling se related problem".
 
 ## Conversation Flow
 1. Greeting/new lead:
    - If message is only "Hello", "Hi", "Info", or "Can I get more info?", ask a guided MI-specific question.
    - Preferred reply:
-     "Namaste, main {display_name} SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
+     "Namaste, main KAMAL SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
 
 2. Concern identified:
    - Acknowledge concern.
@@ -541,7 +287,7 @@ Out-of-India service query:
 
 ## Response Examples
 Generic ad lead:
-"Namaste, main {display_name} SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
+"Namaste, main KAMAL SRIAAS se. Aapka concern kis se related hai: sperm count/fertility, varicocele, erectile issue, sheeghrapatan, ya report review?"
 
 Customer: "Reports nhi hai sir"
 "Koi baat nahi sir. Report nahi hai to bhi aap symptoms bata sakte hain. Problem kab se hai aur main issue kya hai?"
@@ -559,7 +305,7 @@ Customer hesitates to share address:
 "Samajh sakta hoon sir. Address sirf doctor-team record aur medicine courier ke liye chahiye. Payment delivery ke time 100% Cash on Delivery rahega."
 
 Customer asks "Aap doctor ho?"
-"Nahi sir, main {display_name}, SRIAAS ka virtual care coordinator hoon. Doctor team aapko medical guidance degi; main aapka case sahi team tak forward karwata hoon."
+"Nahi sir, main KAMAL, SRIAAS ka virtual care coordinator hoon. Doctor team aapko medical guidance degi; main aapka case sahi team tak forward karwata hoon."
 
 Low sperm count/report:
 "Report mil gayi sir. Isme sperm count/motility low dikh rahi hai. Final guidance doctor review ke baad hi milegi. Kya main aapke liye doctor callback arrange kar doon?"
@@ -574,71 +320,8 @@ Clinic address:
 "SRIAAS clinic address: B-92, near Millennium City Centre Metro Station, Sushant Lok Phase I, Sector 43, Gurugram, Haryana 122009. Aap visit karna chahte hain? Main appointment/callback arrange kar sakta hoon."
 
 Serious post-operation concern:
-"Yeh serious lag raha hai sir. Kripya nearest hospital/emergency doctor ko turant dikhaiye. Saath hi main aapka case SRIAAS doctor team ko urgent basis par forward kar raha hoon."""
-
-        instructions = instructions_override or default_instructions
-        if phone_info:
-            instructions = f"{instructions}\n{phone_info}"
-        if self.allowed_actions:
-            actions = ", ".join(sorted(self.allowed_actions))
-            instructions = (
-                f"{instructions}\n\n## Live Call Actions\n"
-                f"- You may use only these backend actions when the caller clearly asks or agrees: {actions}.\n"
-                "- For clinic address/location on WhatsApp, call perform_voice_action with action_type='send_whatsapp' and include the exact message body.\n"
-                "- For appointment booking requests, call perform_voice_action with action_type='book_appointment_request' and include reason and preferred_time if known.\n"
-                "- For doctor callback requests, call perform_voice_action with action_type='arrange_doctor_callback' and include reason and preferred_time if known.\n"
-                "- For complaints, special requests, or unresolved queries, call perform_voice_action with action_type='create_issue' and include a short reason.\n"
-                "- Do not claim the action is completed until the tool returns success. If it is queued, tell the caller it has been forwarded/queued."
-            )
-
-        super().__init__(instructions=instructions)
-
-    @function_tool
-    async def perform_voice_action(
-        self,
-        context: RunContext,
-        action_type: str,
-        reason: Optional[str] = "",
-        message: Optional[str] = "",
-        preferred_time: Optional[str] = "",
-        details: Optional[str] = "",
-    ) -> str:
-        """Run an approved Frappe action during the live call.
-
-        Use this when the caller asks for WhatsApp information, appointment booking,
-        doctor callback, or when a query/complaint should be logged.
-
-        Args:
-            action_type: One of send_whatsapp, book_appointment_request, arrange_doctor_callback, create_issue.
-            reason: Short reason for the action.
-            message: Exact WhatsApp text to send for send_whatsapp.
-            preferred_time: Preferred appointment/callback time if the caller shared it.
-            details: Extra short context from the call.
-        """
-        action = (action_type or "").strip()
-        if not action:
-            return "Action failed: action_type is required."
-        if self.allowed_actions and action not in self.allowed_actions:
-            return f"Action failed: {action} is not allowed for this voice profile."
-
-        payload = {
-            "action": action,
-            "reason": reason or message or details,
-            "message": message,
-            "preferred_time": preferred_time,
-            "details": details,
-        }
-        result = await post_frappe_voice_action(
-            metadata=self.metadata,
-            caller_phone=self.caller_phone,
-            did_number=self.did_number,
-            action_payload=payload,
+"Yeh serious lag raha hai sir. Kripya nearest hospital/emergency doctor ko turant dikhaiye. Saath hi main aapka case SRIAAS doctor team ko urgent basis par forward kar raha hoon.""",
         )
-        if result.get("success"):
-            if result.get("queued"):
-                return "Action queued successfully. Tell the caller it has been sent/forwarded."
-            return "Action completed successfully. Tell the caller briefly."
-        return f"Action failed: {result.get('error') or result.get('detail') or 'unknown error'}"
 
     @function_tool
     async def create_lead(
@@ -690,17 +373,11 @@ Serious post-operation concern:
             import aiohttp
             import json
             
-            url = os.getenv("MCP_SERVER_URL")
-            if not url:
-                logger.error("MCP_SERVER_URL is not configured; lead cannot be submitted.")
-                return
+            url = os.getenv("MCP_SERVER_URL", "http://tst-mcp.buopso.net/mcp")
             if not url.startswith(("http://", "https://")):
                 url = "http://" + url
                 
-            token = os.getenv("MCP_BEARER_TOKEN")
-            if not token:
-                logger.error("MCP_BEARER_TOKEN is not configured; lead cannot be submitted.")
-                return
+            token = os.getenv("MCP_BEARER_TOKEN", "mcpserverhaibhai6546213846843f5va35fs1v3asf51v6as8vf1as3d5v1a6s8d")
             
             headers = {
                 "Authorization": f"Bearer {token}",
@@ -713,7 +390,7 @@ Serious post-operation concern:
                 "id": 1,
                 "method": "tools/call",
                 "params": {
-                    "name": self.lead_tool_name,
+                    "name": "mcp_create_lead",
                     "arguments": data
                 }
             }
@@ -739,7 +416,7 @@ Serious post-operation concern:
             # If all retries failed, log critically and write to local fallback file
             logger.critical(f"❌ Failed to submit lead for {data['first_name']} ({data['mobile_no']}) after {max_retries} attempts. Saving locally.")
             try:
-                fallback_path = os.getenv("FAILED_LEADS_PATH", "/tmp/failed_leads.jsonl")
+                fallback_path = "/home/vishal/livekit_vienna/failed_leads.jsonl"
                 with open(fallback_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(data) + "\n")
                 logger.info(f"Successfully saved lead data locally in offline queue: {fallback_path}")
@@ -806,95 +483,20 @@ async def entrypoint(ctx: JobContext):
     use_vertex = True
     logger.info("Using platform choice: Vertex AI (enforced by agent configuration)")
 
-    # Join the LiveKit room before reading SIP participant state or starting
-    # the agent session. Telephony calls can otherwise connect at SIP level
-    # while the agent audio pipeline is not attached to the room yet.
-    await ctx.connect()
-
-    # Wait briefly for participant metadata to sync (up to 2 seconds)
-    import asyncio
-    for _ in range(20):
-        if ctx.room.remote_participants:
-            break
-        await asyncio.sleep(0.1)
-
-    # Extract caller ID and dialed DID from SIP participant attributes if available.
-    caller_phone = None
-    did_number = None
-    trunk_id = None
-    for p in ctx.room.remote_participants.values():
-        attrs = getattr(p, "attributes", {}) or {}
-        caller_phone = attrs.get("sip.phoneNumber") or caller_phone
-        did_number = attrs.get("sip.trunkPhoneNumber") or attrs.get("vobiz.did_number") or did_number
-        trunk_id = attrs.get("sip.trunkID") or trunk_id
-        identity = p.identity
-        if caller_phone:
-            break
-        if identity.startswith("sip_"):
-            caller_phone = identity.replace("sip_", "")
-            if caller_phone.startswith("00"):
-                caller_phone = "+" + caller_phone[2:]
-            break
-        elif identity.startswith("+") or identity.isdigit():
-            caller_phone = identity
-            break
-
-    # Fallback: Extract phone number from the room name pattern
-    if not caller_phone and ctx.room.name:
-        import re
-        match = re.search(r'(?:livekit_demo|gemini_live|vobiz)_(\d+)_', ctx.room.name)
-        if match:
-            raw_phone = match.group(1)
-            if raw_phone.startswith("00"):
-                caller_phone = "+" + raw_phone[2:]
-            else:
-                caller_phone = "+" + raw_phone
-
-    metadata = _load_job_metadata(ctx)
-    metadata.update(_load_participant_metadata(ctx))
-    did_number = did_number or metadata.get("did_number") or metadata.get("to_number")
-    if trunk_id and not metadata.get("trunk_id"):
-        metadata["trunk_id"] = trunk_id
-    config = await fetch_frappe_voice_config(caller_phone=caller_phone, did_number=did_number, metadata=metadata)
-    ctx.log_context_fields.update(
-        {
-            "company_key": metadata.get("company_key") or "",
-            "profile_key": metadata.get("profile_key") or config.get("profile_key") or "",
-        }
-    )
-    if config.get("enabled") is False:
-        logger.error("Frappe voice profile was not loaded; using configuration failure prompt only: %s", config.get("config_error"))
-        config = {
-            "agent_name": "Voice Configuration Error",
-            "system_prompt": CONFIG_LOAD_FAILURE_PROMPT,
-            "greeting_instruction": CONFIG_LOAD_FAILURE_GREETING,
-        }
-    gemini_config = config.get("gemini") or {}
-    mcp_config = config.get("mcp") or {}
-
-    for env_name, value in (
-        ("MCP_SERVER_URL", mcp_config.get("server_url")),
-        ("MCP_BEARER_TOKEN", mcp_config.get("bearer_token")),
-        ("GOOGLE_CLOUD_PROJECT", gemini_config.get("google_cloud_project")),
-    ):
-        if value:
-            os.environ[env_name] = value
-
     # Configure Gemini Live model name
-    model_name = gemini_config.get("model") or os.getenv("GEMINI_LIVE_MODEL")
+    model_name = os.getenv("GEMINI_LIVE_MODEL")
     if not model_name:
         if use_vertex:
             model_name = "gemini-live-2.5-flash-native-audio"
         else:
             model_name = "gemini-2.5-flash-native-audio-preview-12-2025"
-    voice_name = gemini_config.get("voice") or os.getenv("GEMINI_LIVE_VOICE") or "Puck"
 
     if use_vertex:
-        vertex_location = gemini_config.get("vertex_location") or os.getenv("VERTEX_LOCATION", "us-central1")
+        vertex_location = os.getenv("VERTEX_LOCATION", "us-central1")
         logger.info(f"Configuring Gemini Live RealtimeModel using Vertex AI ({vertex_location}) with model {model_name}")
         model = realtime.RealtimeModel(
             model=model_name,
-            voice=voice_name,
+            voice="Puck",
             vertexai=True,
             project=os.getenv("GOOGLE_CLOUD_PROJECT"),
             location=vertex_location,
@@ -904,7 +506,7 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"Configuring Gemini Live RealtimeModel using Gemini Developer API (AI Studio) with model {model_name}")
         model = realtime.RealtimeModel(
             model=model_name,
-            voice=voice_name,
+            voice="Puck",
             api_key=os.getenv("GOOGLE_API_KEY"),
             temperature=0.8,
         )
@@ -927,49 +529,74 @@ async def entrypoint(ctx: JobContext):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
-    # Initialize telephony noise cancellation if available
-    nc = None
-    try:
-        from livekit.plugins import noise_cancellation
-        if os.getenv("ENABLE_LIVEKIT_NOISE_CANCELLATION", "").strip().lower() in {"1", "true", "yes"}:
-            nc = noise_cancellation.BVCTelephony()
-            logger.info("Enabling BVCTelephony noise cancellation for the room session.")
-    except Exception as e:
-        logger.warning(f"Could not load noise cancellation plugin: {e}")
-
-    # Start the session with the Frappe-selected voice profile.
-    assistant = Assistant(
-        caller_phone=caller_phone,
-        instructions_override=config.get("system_prompt"),
-        agent_name=config.get("agent_name") or DEFAULT_AGENT_NAME,
-        lead_tool_name=mcp_config.get("lead_creation_tool_name") or "mcp_create_lead",
-        metadata=metadata,
-        did_number=did_number,
-        allowed_actions=(config.get("guardrails") or {}).get("allowed_actions") or [],
-    )
-
     async def log_usage():
         """Log usage summary and await any background tasks on shutdown."""
         summary = usage_collector.get_summary()
         logger.info(f"Usage: {summary}")
         if hasattr(assistant, "pending_tasks") and assistant.pending_tasks:
             logger.info(f"Awaiting {len(assistant.pending_tasks)} pending CRM submission tasks on shutdown...")
+            import asyncio
             await asyncio.gather(*assistant.pending_tasks, return_exceptions=True)
 
     ctx.add_shutdown_callback(log_usage)
 
+    # Wait briefly for participant metadata to sync (up to 2 seconds)
+    import asyncio
+    for _ in range(20):
+        if ctx.room.remote_participants:
+            break
+        await asyncio.sleep(0.1)
+
+    # Extract caller ID from room participants if available
+    caller_phone = None
+    for p in ctx.room.remote_participants.values():
+        identity = p.identity
+        if identity.startswith("sip_"):
+            caller_phone = identity.replace("sip_", "")
+            if caller_phone.startswith("00"):
+                caller_phone = "+" + caller_phone[2:]
+            break
+        elif identity.startswith("+") or identity.isdigit():
+            caller_phone = identity
+            break
+
+    # Fallback: Extract phone number from the room name pattern
+    if not caller_phone and ctx.room.name:
+        import re
+        match = re.search(r'livekit_demo_(\d+)_', ctx.room.name)
+        if match:
+            raw_phone = match.group(1)
+            if raw_phone.startswith("00"):
+                caller_phone = "+" + raw_phone[2:]
+            else:
+                caller_phone = "+" + raw_phone
+
+    # Initialize telephony noise cancellation if available
+    nc = None
+    try:
+        from livekit.plugins import noise_cancellation
+        nc = noise_cancellation.BVCTelephony()
+        logger.info("Enabling BVCTelephony noise cancellation for the room session.")
+    except Exception as e:
+        logger.warning(f"Could not load noise cancellation plugin: {e}")
+
+    # Start the session with Riya assistant
+    assistant = Assistant(caller_phone=caller_phone)
     await session.start(
         agent=assistant,
         room=ctx.room,
         room_input_options=RoomInputOptions(
-            video_enabled=False,
+            video_enabled=True,
             noise_cancellation=nc
         ),
     )
 
+    # Connect to the room
+    await ctx.connect()
+
     # Trigger the agent to speak first!
     await session.generate_reply(
-        instructions=config.get("greeting_instruction") or DEFAULT_GREETING_INSTRUCTION
+        instructions="The call has just connected. Immediately greet the customer warmly in Hindi and introduce yourself and SRIAAS."
     )
 
 

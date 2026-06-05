@@ -1,6 +1,6 @@
 services:
   - type: worker
-    name: vobiz-gemini-live
+    name: sriaas-vobiz-gemini-live
     runtime: docker
     plan: starter
     dockerfilePath: ./Dockerfile
@@ -13,13 +13,15 @@ services:
       - key: LIVEKIT_API_SECRET
         sync: false
       - key: LIVEKIT_AGENT_NAME
-        sync: false
+        value: sriaas-vobiz-gemini-live
       - key: FRAPPE_BASE_URL
-        sync: false
+        value: http://test-sr.butest.tech
       - key: VOICE_AGENT_CONFIG_SECRET
         sync: false
-      - key: GOOGLE_CLOUD_PROJECT
+      - key: X_VOICE_AGENT_SECRET
         sync: false
+      - key: GOOGLE_CLOUD_PROJECT
+        value: newapp-496411
       - key: GOOGLE_APPLICATION_CREDENTIALS_JSON
         sync: false
       - key: VERTEX_LOCATION

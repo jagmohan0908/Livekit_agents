@@ -113,16 +113,25 @@ send_whatsapp,book_appointment_request,arrange_doctor_callback,create_issue
 The worker only exposes actions returned by Frappe config, and Frappe rejects
 any action not allowed on that voice profile.
 
-## Render Deployment
+## Simplest Render Deployment
 
-Create one Render Background Worker per company from this repository.
-
-Recommended service names:
+Create one Render Background Worker for the Sriaas LiveKit project from this
+repository. Render is the worker host; you do not need to create or deploy a
+separate LiveKit Cloud hosted agent. When this process starts, it connects
+outbound to LiveKit and registers the runtime dispatch name:
 
 ```text
 sriaas-vobiz-gemini-live
-bharat-vobiz-gemini-live
-eternity-vobiz-gemini-live
+```
+
+That is the same agent name every Frappe dispatch rule should use.
+
+Use this single Render worker for all Sriaas Frappe voice profiles:
+
+```text
+kamal-male-infertility -> DID/trunk/dispatch rule -> sriaas-vobiz-gemini-live
+chirag-skin            -> DID/trunk/dispatch rule -> sriaas-vobiz-gemini-live
+new-profile            -> DID/trunk/dispatch rule -> sriaas-vobiz-gemini-live
 ```
 
 Runtime:
@@ -140,18 +149,24 @@ python gemini_live_agent.py start
 Use an always-on paid worker. A sleeping/free instance is not suitable for
 production calls.
 
+With the Render Blueprint (`render.yaml`), Render creates the background worker
+service. You only need to fill the secret values in Render. After the service is
+running, LiveKit will show the connected worker, and Frappe can create/update
+SIP dispatch rules that point to it.
+
 ## Required Environment Variables
 
 Set these in the worker service. Do not commit real secrets.
 
 ```bash
-LIVEKIT_URL=wss://company-project.livekit.cloud
+LIVEKIT_URL=wss://sriaas-new-wxe0zawn.livekit.cloud
 LIVEKIT_API_KEY=...
 LIVEKIT_API_SECRET=...
-LIVEKIT_AGENT_NAME=bharat-vobiz-gemini-live
+LIVEKIT_AGENT_NAME=sriaas-vobiz-gemini-live
 
-FRAPPE_BASE_URL=https://company-frappe.example.com
+FRAPPE_BASE_URL=http://test-sr.butest.tech
 VOICE_AGENT_CONFIG_SECRET=...
+X_VOICE_AGENT_SECRET=...
 
 GOOGLE_APPLICATION_CREDENTIALS_JSON='{"type":"service_account", ...}'
 GOOGLE_CLOUD_PROJECT=newapp-496411
@@ -183,13 +198,13 @@ Vobiz AI Settings
 Set:
 
 ```text
-Company Key = bharat-homeopathy
-Public Frappe Base URL = https://company-frappe.example.com
+Company Key = sriaas
+Public Frappe Base URL = http://test-sr.butest.tech
 Voice Agent Config Secret = same value as worker VOICE_AGENT_CONFIG_SECRET
-LiveKit URL = company LiveKit project URL
+LiveKit URL = wss://sriaas-new-wxe0zawn.livekit.cloud
 LiveKit API Key = company LiveKit API key
 LiveKit API Secret = company LiveKit API secret
-LiveKit Agent Dispatch Name = bharat-vobiz-gemini-live
+LiveKit Agent Dispatch Name = sriaas-vobiz-gemini-live
 ```
 
 For each phone number/profile:
@@ -201,11 +216,11 @@ Vobiz Voice Agent Profile
 Set:
 
 ```text
-Profile Key = atul-male-infertility
-Agent Name = Atul
-DID / Phone Number = +917971442066
+Profile Key = kamal-male-infertility
+Agent Name = Kamal
+DID / Phone Number = +919262102420
 LiveKit Inbound Trunk ID = ST_xxxxx
-LiveKit Agent Dispatch Name = bharat-vobiz-gemini-live
+LiveKit Agent Dispatch Name = sriaas-vobiz-gemini-live
 Auto Sync to LiveKit on Save = enabled
 ```
 
@@ -218,9 +233,12 @@ Deploy / Sync to LiveKit
 The LiveKit dispatch rule should show:
 
 ```text
-Agent: bharat-vobiz-gemini-live
+Agent: sriaas-vobiz-gemini-live
 Inbound Routing: ST_xxxxx
 ```
+
+For a second Frappe profile, keep the same LiveKit Agent Dispatch Name and only
+change the profile key, DID, trunk ID, prompt, and optional account mapping.
 
 ## LiveKit Setup Per Company
 

@@ -113,12 +113,13 @@ send_whatsapp,book_appointment_request,arrange_doctor_callback,create_issue
 The worker only exposes actions returned by Frappe config, and Frappe rejects
 any action not allowed on that voice profile.
 
-## Simplest Render Deployment
+## LiveKit Hosted Agent Deployment
 
-Create one Render Background Worker for the Sriaas LiveKit project from this
-repository. Render is the worker host; you do not need to create or deploy a
-separate LiveKit Cloud hosted agent. When this process starts, it connects
-outbound to LiveKit and registers the runtime dispatch name:
+Create one LiveKit Cloud hosted agent for the Sriaas project from this
+repository. LiveKit hosts the worker process and stores the secrets. Do not use
+Render for this setup.
+
+The hosted agent should register this runtime dispatch name:
 
 ```text
 sriaas-vobiz-gemini-live
@@ -126,7 +127,7 @@ sriaas-vobiz-gemini-live
 
 That is the same agent name every Frappe dispatch rule should use.
 
-Use this single Render worker for all Sriaas Frappe voice profiles:
+Use this single LiveKit hosted agent for all Sriaas Frappe voice profiles:
 
 ```text
 kamal-male-infertility -> DID/trunk/dispatch rule -> sriaas-vobiz-gemini-live
@@ -134,29 +135,34 @@ chirag-skin            -> DID/trunk/dispatch rule -> sriaas-vobiz-gemini-live
 new-profile            -> DID/trunk/dispatch rule -> sriaas-vobiz-gemini-live
 ```
 
-Runtime:
+The repo includes `livekit.toml` for the Sriaas project:
 
-```text
-Docker
+```toml
+[project]
+  subdomain = "sriaas-new-wxe0zawn"
+
+[agent]
+  id = "CA_xxxxx"
 ```
 
-Start command is already defined in the Dockerfile:
+After creating the hosted agent, update the `id` in `livekit.toml` to the new
+`CA_...` value.
+
+Deploy/update the hosted agent from this repo:
 
 ```bash
-python gemini_live_agent.py start
+lk agent deploy
 ```
 
-Use an always-on paid worker. A sleeping/free instance is not suitable for
-production calls.
+Check status:
 
-With the Render Blueprint (`render.yaml`), Render creates the background worker
-service. You only need to fill the secret values in Render. After the service is
-running, LiveKit will show the connected worker, and Frappe can create/update
-SIP dispatch rules that point to it.
+```bash
+lk agent status
+```
 
-## Required Environment Variables
+## Required LiveKit Agent Secrets
 
-Set these in the worker service. Do not commit real secrets.
+Set these as LiveKit agent secrets. Do not commit real secrets.
 
 ```bash
 LIVEKIT_URL=wss://sriaas-new-wxe0zawn.livekit.cloud
@@ -176,6 +182,12 @@ GEMINI_LIVE_MODEL=gemini-live-2.5-flash-native-audio
 GEMINI_LIVE_VOICE=Puck
 ```
 
+For Google credentials, add a LiveKit file secret named `creds.json`, then set:
+
+```bash
+GOOGLE_APPLICATION_CREDENTIALS=/etc/secrets/creds.json
+```
+
 Optional:
 
 ```bash
@@ -183,9 +195,8 @@ MCP_SERVER_URL=
 MCP_BEARER_TOKEN=
 ```
 
-`GOOGLE_APPLICATION_CREDENTIALS_JSON` should contain the full Google service
-account JSON as a single environment variable. On startup the worker writes it
-to `/tmp/google-credentials.json`.
+`GOOGLE_APPLICATION_CREDENTIALS_JSON` is also supported for non-LiveKit hosts,
+but LiveKit file secret `creds.json` is preferred here.
 
 ## Frappe Setup Per Company
 
@@ -251,31 +262,6 @@ For each company project:
 5. Put the LiveKit credentials in that company Frappe settings.
 6. Put the same LiveKit credentials in that company worker env.
 7. Sync routes from Frappe.
-
-## AWS Deployment
-
-The worker can run on AWS instead of Render. It still does not need a public URL.
-
-Recommended:
-
-```text
-ECS Fargate service
-```
-
-Simple low-cost alternative:
-
-```text
-EC2 + Docker + systemd/supervisor
-```
-
-Required networking:
-
-```text
-Outbound internet to LiveKit Cloud
-Outbound internet to Frappe public URL
-Outbound internet to Google APIs
-Inbound public HTTP: not required
-```
 
 ## Local Development
 

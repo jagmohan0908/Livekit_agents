@@ -978,6 +978,6 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
-            agent_name=os.getenv("LIVEKIT_AGENT_NAME", "vobiz-gemini-live"),
+            agent_name=os.getenv("LIVEKIT_AGENT_NAME", "sriaas-vobiz-gemini-live"),
         )
     )
